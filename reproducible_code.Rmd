@@ -1,0 +1,356 @@
+---
+title: "reproducible_code"
+output: html_document
+date: "2025-01-10"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+This document explains how to reproduce the analysis relating to a HIPEC trial. 
+
+The data has been provided by the LUMC and comes from the Dutch Cancer Registry.
+
+# Loading data 
+Firstly load this data:
+```{r}
+df = read.csv("Z:/Owen and Maja/24-00292.csv", sep=";")
+```
+
+# Loading the required packages 
+```{r}
+library(dplyr)
+library(survival)
+library(ggplot2)
+library(cobalt)
+library(splines)
+library(corrplot)
+```
+
+Some columns are not necessary for this analysis so they will be removed now
+```{r}
+# removing unnecessary columns 
+df = df %>% select(-c(regiogyn_contact, regiogyn_bel_ther, chir_opnameduur1, 
+                   chir_opnameduur2, chir_opnameduur3, stad_compleet, compl))
+```
+
+For clinical reasons the time variable will be converted from days into months
+```{r}
+# converting time interval into months
+df$vit_stat_int = df$vit_stat_int / 30
+```
+
+# Data Cleaning
+
+## Missing data 
+There is rather a lot of missing data so there are multiple steps to clean the 
+dataset. 
+
+```{r}
+#Firstly all missing values in surgery type (chirtype) are converted into 0s
+df$chir_type1[is.na(df$chir_type1)] = 0
+df$chir_type2[is.na(df$chir_type2)] = 0
+df$chir_type3[is.na(df$chir_type3)] = 0
+
+#Missing values for debulking results are converted into a separate category (3) if the individual did actually receive a debulking surgery and into the unknown category if they are missing without a debulking surgery (9) 
+
+df$deb_uitslag[(df$chir_type1 == 5 | df$chir_type2 ==5) & is.na(df$deb_uitslag) ] = 9
+df$deb_uitslag[is.na(df$deb_uitslag)] = 3
+
+#Next we handle the missing values in chemotherapy courses. If the data for platinum or taxaan is missing but the chemo category indicates the individual did not have chemotherapy then the missing values are converted into 0 chemotherapy courses
+
+df$platinum_chemo_prechir_kuren[df$chemo==0 & is.na(df$platinum_chemo_prechir_kuren)] = 0
+df$taxaan_chemo_prechir_kuren[df$chemo==0 & is.na(df$taxaan_chemo_prechir_kuren)] = 0
+df$platinum_chemo_prechir_kuren[df$chemo==2 & is.na(df$platinum_chemo_prechir_kuren)] = 0
+df$taxaan_chemo_prechir_kuren[df$chemo==2 & is.na(df$taxaan_chemo_prechir_kuren)] = 0
+
+#finally unknown values for chemotherapy courses which cannot be inferred are removed
+index = df %>% filter(taxaan_chemo_prechir_kuren == 99 | platinum_chemo_prechir_kuren == 99)
+idx = index$key_nkr
+df = df[!df$key_nkr %in% idx, ]
+```
+
+
+## Cleaning the data
+
+```{r}
+#There are 12 patients that received HIPEC but are in period 1. The client advised us to move these into period 2 (when the treatment is introduced)
+df$periode[df$hipec == 1 & df$periode == 1] = 2
+
+#converting relevant variables to factor 
+factor_vars = c("chir_type1", "chir_type2", "chir_type3", "hipec", "parp",
+                "chemo", "figo", "deb_uitslag", "morf_cat", "periode", "klin_stad")
+
+df[factor_vars] <- lapply(df[factor_vars], as.factor)
+
+#The morphology variable is converted into a binary variable where a 1 represents a sereus carcinoma and a 0 represents no sereus carcinoma
+df$morf_cat = ifelse(df$morf_cat == 1, 1, 0) 
+```
+
+# Research Question 1
+
+This research question investigates the impact of the introduction of HIPEC on the survival of FIGO 3 patients
+
+Firstly we will clean the dataset such that it matches the required assumptions for the analysis
+```{r}
+#Firstly filter the dataset such that it only includes patients in FIGO 3B and FIGO 3C as these are the cancer stages selected for the treatment
+df1 = df %>% filter(figo %in% c("3C", "3B")) %>% droplevels()
+
+# There is no data available for chemo 4 patients as the chemo data is missing and they do not receive any surgeries. So these are removed from the dataset
+df1 = df1 %>% filter(chemo != 4)
+
+# Now removes any remaining missing values in the chemotherapy courses
+df1_cc = df1 %>% filter(!is.na(platinum_chemo_prechir_kuren))
+df1_cc = df1 %>% filter(!is.na(taxaan_chemo_prechir_kuren))
+df1_cc = df1_cc[df1_cc$key_nkr != 890462404,]
+
+# Converting the surgery variable into a binary variable with a 1 if they received debulking surgery and 0 otherwise
+df1_cc$chir_type1_binary = ifelse(df1_cc$chir_type1==5, 1, 0) 
+df1_cc$chir_type2_binary = ifelse(df1_cc$chir_type2==5, 1, 0) 
+
+# filtering debulking results to only optimal and complete as these results are required to give HIPEC to a patient
+df1_cc = df1_cc %>% filter(deb_uitslag %in% c(1,2)) %>% droplevels()
+
+
+# filtering chemotherapy to a pre-surgical binary variable
+df1_cc$chemo_binary = ifelse(df1_cc$chemo %in% c(1,3), 1, 0)
+
+# The data claimes that 5 hipec patients did not have pre-surgical chemo but our client stated that pre-surgical chemotherapy is required for HIPEC to be given so we have imputed this data such that these 5 patients now received chemotherapy with the average of 3 pre and 3 post surgical chemotherpay courses
+df1_cc %>% filter(hipec==1, chemo_binary==0)
+df1_cc[df1_cc$hipec==1 & df1_cc$chemo_binary==0,]$platinum_chemo_prechir_kuren = 3 
+df1_cc[df1_cc$hipec==1 & df1_cc$chemo_binary==0,]$taxaan_chemo_prechir_kuren = 3
+df1_cc[df1_cc$hipec==1 & df1_cc$chemo_binary==0,]$chemo_binary = 1
+
+# Finally selecting only patients that received pre-surgical chemotherapy
+df1_cc = df1_cc %>% filter(chemo_binary==1)
+```
+
+## Exploratory data analysis 
+
+Initial descriptive statistic of dataframe (pre-cleaning)
+```{r}
+check = df %>% filter(figo %in% c("3B", "3C"))
+fit <- survfit(Surv(vit_stat_int, vit_stat) ~ hipec, data = check)
+plot(fit, xlab = "Time since incidence (months)", ylab = "Survival Probability", col=c("blue", "red"), 
+     main="Kaplan-Meier curve for treatment groups before data cleaning")
+# Add a vertical dashed line at 36 months with a lighter color
+abline(v = 36, col = "darkgray", lty = 2, lwd = 1.5)
+legend("topright", legend=c("HIPEC", "no HIPEC"), col=c("red", "blue"), lty=1)
+```
+
+Post cleaning survival curves
+```{r}
+fit <- survfit(Surv(vit_stat_int, vit_stat) ~ hipec, data = df1_cc)
+plot(fit, xlab = "Time since incidence (months)", ylab = "Survival Probability", col=c("blue", "red"), 
+     main="Kaplan-Meier curve for treatment groups after data cleaning")
+# Add a vertical dashed line at 36 months with a lighter color
+abline(v = 36, col = "darkgray", lty = 2, lwd = 1.5)
+legend("topright", legend=c("HIPEC", "no HIPEC"), col=c("red", "blue"), lty=1)
+```
+
+## IPW 
+This section focuses on the inverse probability of treatment weighting method. 
+
+Firstly fitting the propensity score model
+```{r}
+ps_model <- glm(hipec ~ leeft + figo + 
+                         chir_type1_binary + chir_type2_binary +
+                         platinum_chemo_prechir_kuren + taxaan_chemo_prechir_kuren +
+                        deb_uitslag,
+                      family = binomial, data = df1_cc)
+```
+
+Obtaining predicted values for the propensity scores and then checking the positivity assumption with a density plot
+```{r}
+df1_cc$ps = ps_model$fitted.values
+df1_cc_hipec0 = filter(df1_cc, hipec==0)
+df1_cc_hipec1 = filter(df1_cc, hipec==1)
+
+plot(density(df1_cc_hipec0$ps), xlim=c(0,1), ylim=c(0,4),
+     main="Density plot of the propensity scores for the two treatment groups", col="blue")
+lines(density(df1_cc_hipec1$ps), col="red")
+legend("topright", legend=c("HIPEC", "no HIPEC"), col=c("red", "blue"),
+       lty=1)
+```
+
+Next fitting the inverse propensity score weights 
+```{r}
+df1_cc$weights = ifelse(df1_cc$hipec == 1, 1 / df1_cc$ps, 1 / (1 - df1_cc$ps))
+```
+
+Inspecting a love plot to see if the assumption of exchangeability is violated
+```{r}
+vars = c("leeft", "figo", #"chemo_binary",
+                        "taxaan_chemo_prechir_kuren",
+         "chir_type1_binary",
+         "chir_type2_binary",
+         "platinum_chemo_prechir_kuren",
+         "deb_uitslag" 
+         #"pre_chemo_courses"
+         )
+covariates = df1_cc[,vars]
+colnames(covariates) = c("Age", "FIGO", "pre-surgical taxane courses", "binary surgery type 1",
+                         "binary surgery type 2", "pre-surgical platinum courses", 
+                         "debulking results")
+bt = bal.tab(covariates, treat = df1_cc$hipec, weights = df1_cc$weights, 
+        method = "weighting", un=TRUE)
+
+love.plot(covariates,  treat = df1_cc$hipec, weights = df1_cc$weights,
+          method = "weighting",   binary = "std", threshold = .1)
+```
+
+Now calculating the average treatment effect for this method 
+
+```{r}
+fit <- survfit(Surv(vit_stat_int, vit_stat) ~ hipec, data = df1_cc, weights = weights)
+fit_summary <- summary(fit, times = 36)
+surv_hipec_0 <- fit_summary$surv[fit_summary$strata == "hipec=0"]
+surv_hipec_1 <- fit_summary$surv[fit_summary$strata == "hipec=1"]
+survival_diff <- surv_hipec_1 - surv_hipec_0
+survival_diff
+```
+Calculating the standard error. 
+```{r}
+# Extract variances from the survfit object
+var_hipec_0 <- fit_summary$std.err[fit_summary$strata == "hipec=0"]^2
+var_hipec_1 <- fit_summary$std.err[fit_summary$strata == "hipec=1"]^2
+
+# Calculate variance of the ATE
+var_ate <- var_hipec_1 + var_hipec_0
+
+# Standard error of the ATE
+se_ate <- sqrt(var_ate)
+se_ate
+```
+
+
+
+Weighted log rank test
+```{r}
+summary(coxph(Surv(time = vit_stat_int, event = vit_stat) ~ hipec, 
+             data = df1_cc, 
+             robust = TRUE, 
+             weights = weights))
+```
+
+## Outcome Regression 
+
+Firstly fitting the outcome model 
+```{r}
+model = coxph(Surv(vit_stat_int, vit_stat) ~ hipec+ leeft + figo + 
+                        taxaan_chemo_prechir_kuren +chir_type1_binary+
+                        chir_type2_binary +
+                        platinum_chemo_prechir_kuren + incjr + deb_uitslag,
+                       data = df1_cc)
+```
+
+Creating two pseudo populations. One where all patients receive the treatment and one where all patients do not receive the treatment
+
+```{r}
+treated_dataset = df1_cc
+treated_dataset$hipec = 1  # Set all to treated
+
+non_treated_dataset = df1_cc
+non_treated_dataset$hipec = 0  # Set all to untreated
+```
+
+Calculating the ATE from these two pseudo populations 
+```{r}
+#make predictions for each dataset
+surv_treated = survfit(model, newdata = treated_dataset)
+surv_non_treated = survfit(model, newdata = non_treated_dataset)
+
+timepoint <- 36  # setting the 36 month timepoint for calculating the ATE
+
+#obtain the survival probabilities for each population at 36 months for each patient
+survival_treated_at_3 <- summary(surv_treated, times = timepoint)$surv
+survival_non_treated_at_3 <- summary(surv_non_treated, times = timepoint)$surv
+
+#average across all patients to obtain average survival probabilities at 36 months
+avg_surv_treated <- mean(survival_treated_at_3)
+avg_surv_non_treated <- mean(survival_non_treated_at_3)
+
+#calculate difference between average survival probability of each population to obtain the ATE
+or_ate = avg_surv_treated - avg_surv_non_treated
+or_ate
+```
+
+```{r}
+# Set up the bootstrap process
+set.seed(123)  # for reproducibility
+n_boot <- 1000  # number of bootstrap samples
+bootstrap_ates <- numeric(n_boot)
+
+for (i in 1:n_boot) {
+  # Resample the data with replacement
+  bootstrap_data <- df1_cc[sample(nrow(df1_cc), replace = TRUE), ]
+  
+  # Fit the model to the bootstrap sample
+  bootstrap_model <- coxph(Surv(vit_stat_int, vit_stat) ~ hipec+ leeft + figo + 
+                        taxaan_chemo_prechir_kuren +chir_type1_binary+
+                        chir_type2_binary +
+                        platinum_chemo_prechir_kuren + incjr + deb_uitslag,
+                       data = bootstrap_data)
+  
+  # Make predictions for treated and non-treated datasets
+  surv_treated <- survfit(bootstrap_model, newdata = treated_dataset)
+  surv_non_treated <- survfit(bootstrap_model, newdata = non_treated_dataset)
+  
+  # Obtain survival probabilities at the timepoint (36 months)
+  survival_treated_at_3 <- summary(surv_treated, times = timepoint)$surv
+  survival_non_treated_at_3 <- summary(surv_non_treated, times = timepoint)$surv
+  
+  # Calculate the ATE for the bootstrap sample
+  avg_surv_treated <- mean(survival_treated_at_3)
+  avg_surv_non_treated <- mean(survival_non_treated_at_3)
+  bootstrap_ates[i] <- avg_surv_treated - avg_surv_non_treated
+}
+
+# Calculate the standard error as the standard deviation of the bootstrap ATEs
+se_ate <- sd(bootstrap_ates)
+```
+
+
+# Research Question Two
+This research question investigates the impact of the introduction of HIPEC on all FIGO stages
+
+Firstly creating binary variables for chemotherapy and surgery type as done in research question 1
+```{r}
+#chemo binary is 1 if patient received chemotherapy before surgery and 0 otherwise
+df$chemo_binary = ifelse(df$chemo %in% c(1,3),1,0 ) 
+
+#the binary surgery variables are 1 if the patient received debulking and 0 otherwise
+df$chir_type1_binary = ifelse(df$chir_type1==5, 1, 0)
+df$chir_type2_binary = ifelse(df$chir_type2==5, 1, 0)
+df$chir_type3_binary = ifelse(df$chir_type3==5, 1, 0)
+```
+
+
+Now removing the HIPEC patients that are in FIGO 1C and 4A as these should not have received HIPEC and so will bias the results
+```{r}
+key = df %>% filter(hipec==1, !figo %in% c("3B", "3C")) %>% select(key_nkr)
+key = as.numeric(key$key_nkr)
+df = df %>% filter(!key_nkr %in% key)
+```
+
+Finally fitting a cox proportional hazards model where the survival outcome is regressed on the treatment, the year, the period, and the other relevant covariates in the dataset. The aim is to infer from the hazard ratio of periode2 to understand how the risk of dying changed from period 1 (no HIPEC) to period 2 (HIPEC introduced)
+```{r}
+cox = coxph(Surv(time = vit_stat_int, event = vit_stat) ~ hipec + periode + incjr +
+        morf_cat + leeft + chir_type1_binary + chir_type2_binary + chir_type3_binary+
+          deb_uitslag + chemo_binary +
+        platinum_chemo_prechir_kuren + taxaan_chemo_prechir_kuren +
+          parp + figo, data = df)
+
+summary(cox)
+```
+
+
+
+
+
+
+
+
+
+
