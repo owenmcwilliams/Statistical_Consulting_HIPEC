@@ -345,6 +345,193 @@ cox = coxph(Surv(time = vit_stat_int, event = vit_stat) ~ hipec + periode + incj
 summary(cox)
 ```
 
+# Supplementary analysis (in appendix)
+
+This analysis focuses on patients that received 3 courses of chemotherapy before surgery and 3 after. The number of courses after surgery is conditional on the outcome of the surgery, therefore this is not a causal effect as the rules of causal inference are violated. For this reason these results were placed in the appendix for future reference. 
+
+The analysis follows the same methodology as used in research question one 
+
+## IPW
+
+Subsetting the data to only include patients with 3 chemotherapy courses before and after surgery
+```{r}
+#table(df1_chemo$chemo, df1_chemo$hipec)
+df1_chemo = df1_cc %>% filter(chemo==3, taxaan_chemo_prechir_kuren==3,
+                              platinum_chemo_prechir_kuren==3, 
+                              taxaan_chemo_postchir_kuren == 3,
+                              platinum_chemo_postchir_kuren==3)
+
+```
+
+Fitting the same propensity score model
+```{r}
+
+ps_model <- glm(hipec ~ leeft + figo  + 
+                          chir_type1_binary + chir_type2_binary +
+                          deb_uitslag,
+                      family = binomial, data = df1_chemo)
+
+```
+
+
+Plotting density curve
+```{r}
+df1_chemo$ps = ps_model$fitted.values
+
+df1_chemo_hipec0 = filter(df1_chemo, hipec==0)
+df1_chemo_hipec1 = filter(df1_chemo, hipec==1)
+
+plot(density(df1_chemo_hipec0$ps), xlim=c(0,1), ylim=c(0,3.5), main="Propensity score density plot",
+     col="blue")
+lines(density(df1_chemo_hipec1$ps), col="red")
+legend("topright", legend=c("no hipec", "hipec"), col=c("blue", "red"),
+       lty=1) 
+
+```
+
+Fitting weights 
+
+```{r}
+df1_chemo$weights = ifelse(df1_chemo$hipec == 1, 1 / df1_chemo$ps, 1 / (1 - df1_chemo$ps))
+```
+
+
+Love plot to see balancing of variables 
+Checking balance between covariates with love plot (standardised mean difference)
+```{r}
+vars = c("leeft", "figo",
+                         "chir_type1_binary",
+         "chir_type2_binary",
+         "deb_uitslag")
+covariates = df1_chemo[,vars]
+bt = bal.tab(covariates, treat = df1_chemo$hipec, weights = df1_chemo$weights, 
+        method = "weighting", un=TRUE)
+
+love.plot(covariates,  treat = df1_chemo$hipec, weights = df1_chemo$weights,
+          method = "weighting",   binary = "std", threshold = .1)
+```
+
+Calculating ATE for weights
+```{r}
+fit <- survfit(Surv(vit_stat_int, vit_stat) ~ hipec, data = df1_chemo, weights = weights)
+fit_summary <- summary(fit, times = 36)
+surv_hipec_0 <- fit_summary$surv[fit_summary$strata == "hipec=0"]
+surv_hipec_1 <- fit_summary$surv[fit_summary$strata == "hipec=1"]
+survival_diff <- surv_hipec_1 - surv_hipec_0
+survival_diff
+```
+Calculating the standard error
+```{r}
+# Extract variances from the survfit object
+var_hipec_0 <- fit_summary$std.err[fit_summary$strata == "hipec=0"]^2
+var_hipec_1 <- fit_summary$std.err[fit_summary$strata == "hipec=1"]^2
+
+# Calculate variance of the ATE
+var_ate <- var_hipec_1 + var_hipec_0
+
+# Standard error of the ATE
+se_ate <- sqrt(var_ate)
+se_ate
+```
+
+
+plotting the weighted kaplan meier curves
+```{r}
+plot(fit, xlab = "Time since incidence (months)", ylab = "Survival Probability", col=c("blue", "red"), 
+     main="Optimal treatment patients 
+     (3 chemotherapy courses pre and post surgery)")
+# Add a vertical dashed line at 36 months with a lighter color
+abline(v = 36, col = "darkgray", lty = 2, lwd = 1.5)
+legend("topright", legend=c("no hipec", "hipec"), col=c("blue", "red"), lty=1)
+
+#df1_chemo %>% arrange(desc(weights))
+```
+
+
+## Outcome Regression 
+Fitting outcome model 
+```{r}
+model = coxph(Surv(vit_stat_int, vit_stat) ~ hipec+ leeft + figo  + 
+                         chir_type1_binary + chir_type2_binary +
+                          incjr + deb_uitslag,
+                       data = df1_chemo)
+```
+
+Creating two pseudo populations (one where everyone has the treatment and one where no one has the treatment)
+```{r}
+treated_dataset = df1_chemo
+treated_dataset$hipec = 1  # Set all to treated
+
+non_treated_dataset = df1_chemo
+non_treated_dataset$hipec = 0  # Set all to untreated
+```
+
+Predicting survival probabilities for the two pseudo populations and then calculating ATE
+```{r}
+surv_treated = survfit(model, newdata = treated_dataset)
+surv_non_treated = survfit(model, newdata = non_treated_dataset)
+
+#plot(surv_treated)
+#plot(surv_non_treated)
+
+timepoint <- 36  # 3 years
+
+survival_treated_at_3 <- summary(surv_treated, times = timepoint)$surv
+survival_non_treated_at_3 <- summary(surv_non_treated, times = timepoint)$surv
+
+avg_surv_treated <- mean(survival_treated_at_3)
+avg_surv_non_treated <- mean(survival_non_treated_at_3)
+
+avg_surv_treated - avg_surv_non_treated
+```
+
+Bootstrapping the outcome regression method to obtain a standard error estimate
+```{r, message=F, warning=F}
+# Set up the bootstrap process
+set.seed(123)  # for reproducibility
+n_boot <- 1000  # number of bootstrap samples
+bootstrap_ates <- numeric(n_boot)
+timepoint = 36
+
+for (i in 1:n_boot) {
+  # Resample the data with replacement
+  bootstrap_data <- df1_chemo[sample(nrow(df1_chemo), replace = TRUE), ]
+  
+  # Fit the model to the bootstrap sample
+  bootstrap_model <- coxph(Surv(vit_stat_int, vit_stat) ~ hipec+ leeft + figo  + 
+                         chir_type1_binary + chir_type2_binary +
+                          incjr + deb_uitslag,
+                       data = bootstrap_data)
+  
+  # Make predictions for treated and non-treated datasets
+  surv_treated <- survfit(bootstrap_model, newdata = treated_dataset)
+  surv_non_treated <- survfit(bootstrap_model, newdata = non_treated_dataset)
+  
+  # Obtain survival probabilities at the timepoint (36 months)
+  survival_treated_at_3 <- summary(surv_treated, times = timepoint)$surv
+  survival_non_treated_at_3 <- summary(surv_non_treated, times = timepoint)$surv
+  
+  # Calculate the ATE for the bootstrap sample
+  avg_surv_treated <- mean(survival_treated_at_3)
+  avg_surv_non_treated <- mean(survival_non_treated_at_3)
+  bootstrap_ates[i] <- avg_surv_treated - avg_surv_non_treated
+}
+
+# Calculate the standard error as the standard deviation of the bootstrap ATEs
+se_ate <- sd(bootstrap_ates)
+```
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
